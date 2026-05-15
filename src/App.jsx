@@ -1,4 +1,4 @@
-mport { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 
 const B = {
   gold:"#F7A019", orange:"#E85D1A", red:"#C0271A",
@@ -118,9 +118,7 @@ function SetupScreen({ onSave }) {
       } else if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
         setErr("Network error. Please check your internet connection and try again.");
       } else {
-        // If we can't determine the error, try connecting anyway
-        // The key might still work for actual requests
-        setErr(`Connection issue: ${msg}. Try again or check console.anthropic.com`);
+        setErr("Connection issue. Try again or check console.anthropic.com");
       }
       localStorage.removeItem("cj_api_key");
     }
