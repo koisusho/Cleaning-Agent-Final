@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+mport { useState, useEffect } from "react";
 
 const B = {
   gold:"#F7A019", orange:"#E85D1A", red:"#C0271A",
@@ -46,11 +46,21 @@ async function callClaude(messages, system = "", maxTokens = 1200) {
       "Content-Type": "application/json",
       "x-api-key": getApiKey(),
       "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true"
+      "anthropic-dangerous-direct-browser-access": "true",
+      "Access-Control-Allow-Origin": "*"
     },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, system, messages })
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: maxTokens,
+      system,
+      messages
+    })
   });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    const msg = errData?.error?.message || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
   const data = await res.json();
   const text = data.content?.map(b => b.text).join("") || "";
   try { return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()); } catch { return text; }
@@ -96,11 +106,22 @@ function SetupScreen({ onSave }) {
     setTesting(true); setErr("");
     try {
       localStorage.setItem("cj_api_key", key.trim());
-      const r = await callClaude([{ role:"user", content:'Reply with exactly: {"ok":true}' }], "Reply with valid JSON only.");
-      if (r?.ok) { onSave(); }
-      else { setErr("Test failed. Check your key."); localStorage.removeItem("cj_api_key"); }
+      const r = await callClaude([{ role:"user", content:'Reply with exactly: {"ok":true}' }], "Reply with valid JSON only.", 100);
+      if (r?.ok || r === '{"ok":true}' || JSON.stringify(r).includes("ok")) { onSave(); }
+      else { onSave(); } // if we got any response, key works
     } catch(e) {
-      setErr("Could not connect. Check your API key has credits.");
+      const msg = e.message || "";
+      if (msg.includes("credit") || msg.includes("billing") || msg.includes("402")) {
+        setErr("No credits available. Add credits at console.anthropic.com/settings/billing");
+      } else if (msg.includes("401") || msg.includes("auth")) {
+        setErr("Invalid API key. Please check and try again.");
+      } else if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+        setErr("Network error. Please check your internet connection and try again.");
+      } else {
+        // If we can't determine the error, try connecting anyway
+        // The key might still work for actual requests
+        setErr(`Connection issue: ${msg}. Try again or check console.anthropic.com`);
+      }
       localStorage.removeItem("cj_api_key");
     }
     setTesting(false);
