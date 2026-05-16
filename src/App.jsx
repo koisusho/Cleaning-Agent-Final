@@ -50,7 +50,7 @@ async function callClaude(messages, system = "", maxTokens = 1200) {
       "Access-Control-Allow-Origin": "*"
     },
     body: JSON.stringify({
-      model: "claude-opus-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: maxTokens,
       system,
       messages
@@ -77,7 +77,7 @@ async function callClaudeVision(b64, mime = "image/jpeg") {
       "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
-      model: "claude-opus-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 2000,
       system: "You are a health & safety inspector for a Mexican restaurant kitchen. You ALWAYS respond with valid JSON only — no preamble, no markdown, no explanation. Just raw JSON.",
       messages: [{
