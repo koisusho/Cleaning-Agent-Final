@@ -96,7 +96,7 @@ Respond ONLY with this exact JSON structure, no other text:
 }`;
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${getGeminiKey()}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${getGeminiKey()}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
