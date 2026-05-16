@@ -66,6 +66,16 @@ async function callClaude(messages, system = "", maxTokens = 1200) {
   try { return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()); } catch { return text; }
 }
 
+function extractJSON(raw) {
+  let s = raw.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
+  try { return JSON.parse(s); } catch {}
+  const a = s.indexOf("{"), b = s.lastIndexOf("}");
+  if (a !== -1 && b > a) { try { return JSON.parse(s.slice(a, b+1)); } catch {} }
+  const m = s.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  return null;
+}
+
 async function callClaudeVision(b64, mime = "image/jpeg") {
   const validMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mime) ? mime : "image/jpeg";
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -79,14 +89,17 @@ async function callClaudeVision(b64, mime = "image/jpeg") {
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
       max_tokens: 2000,
-      system: "You are a health & safety inspector for a Mexican restaurant kitchen. You ALWAYS respond with valid JSON only — no preamble, no markdown, no explanation. Just raw JSON.",
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image", source: { type: "base64", media_type: validMime, data: b64 } },
-          { type: "text", text: `Analyze this kitchen image from Casa Jaguar Mexican Food & Cafe, Glenorchy NZ.\n\nIdentify ALL visible cleaning tasks, hygiene issues, and maintenance needs you can see.\n\nRespond with ONLY this JSON structure (no other text):\n{\n  "areaDetected": "name of the kitchen area visible",\n  "overallRisk": "low|medium|high|critical",\n  "riskSummary": "one sentence describing the main hygiene concern",\n  "tasks": [\n    {\n      "name": "specific cleaning task name",\n      "area": "prep|grill|dishpit|walkin|storage|foh|bathrooms|patio|express",\n      "reason": "what you can see that requires this task",\n      "priority": "critical|high|medium|low",\n      "frequency": "Daily|Weekly|Monthly",\n      "timeEstimate": "X min",\n      "products": "specific cleaning products needed",\n      "sopContent": "1. Step one\\n2. Step two\\n3. Step three\\n4. Step four\\n5. Step five\\n⚠️ Safety tip here"\n    }\n  ]\n}` }
-        ]
-      }]
+      system: "You are a health & safety inspector for a Mexican restaurant. Output ONLY raw JSON. No markdown, no explanation, no preamble. Start with { and end with }.",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: validMime, data: b64 } },
+            { type: "text", text: `Analyze this kitchen image from Casa Jaguar Mexican Food & Cafe, Glenorchy NZ. Identify all cleaning tasks and hygiene issues visible. Return ONLY this JSON (nothing else before or after):\n{"areaDetected":"area name","overallRisk":"low|medium|high|critical","riskSummary":"one sentence","tasks":[{"name":"task","area":"prep|grill|dishpit|walkin|storage|foh|bathrooms|patio|express","reason":"what you see","priority":"critical|high|medium|low","frequency":"Daily|Weekly|Monthly","timeEstimate":"X min","products":"products","sopContent":"1. Step\\n2. Step\\n3. Step\\n4. Step\\n5. Step\\n\u26a0\ufe0f Safety tip"}]}` }
+          ]
+        },
+        { role: "assistant", content: "{" }
+      ]
     })
   });
   if (!res.ok) {
@@ -94,13 +107,11 @@ async function callClaudeVision(b64, mime = "image/jpeg") {
     throw new Error(errData?.error?.message || `HTTP ${res.status}`);
   }
   const data = await res.json();
-  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
-  try {
-    return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim());
-  } catch(e) {
-    console.error("Vision parse error. Raw response:", text);
-    throw new Error("AI response was not valid JSON. Try again.");
-  }
+  const tail = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  const parsed = extractJSON("{" + tail);
+  if (parsed) return parsed;
+  console.error("Vision parse failed. Raw:", tail);
+  throw new Error("AI response was not valid JSON. Try again.");
 }
 
 function getStatus(task, logs) {
