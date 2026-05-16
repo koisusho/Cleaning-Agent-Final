@@ -50,7 +50,7 @@ async function callClaude(messages, system = "", maxTokens = 1200) {
       "Access-Control-Allow-Origin": "*"
     },
     body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-opus-4-20250514",
       max_tokens: maxTokens,
       system,
       messages
@@ -62,18 +62,45 @@ async function callClaude(messages, system = "", maxTokens = 1200) {
     throw new Error(msg);
   }
   const data = await res.json();
-  const text = data.content?.map(b => b.text).join("") || "";
+  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
   try { return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()); } catch { return text; }
 }
 
 async function callClaudeVision(b64, mime = "image/jpeg") {
-  return callClaude([{
-    role: "user",
-    content: [
-      { type: "image", source: { type: "base64", media_type: mime, data: b64 } },
-      { type: "text", text: `Analyze this image from Casa Jaguar Mexican Food & Cafe, Glenorchy NZ. Identify ALL cleaning tasks and hygiene issues.\n\nReturn ONLY JSON:\n{"areaDetected":"area name","overallRisk":"low|medium|high|critical","riskSummary":"one sentence","tasks":[{"name":"task","area":"prep|grill|dishpit|walkin|storage|foh|bathrooms|patio|express","reason":"what you see","priority":"critical|high|medium|low","frequency":"Daily|Weekly|Monthly","timeEstimate":"X min","products":"products","sopContent":"numbered steps with safety tip"}]}` }
-    ]
-  }], "You are a health & safety inspector for a Mexican restaurant. JSON only.", 2000);
+  const validMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mime) ? mime : "image/jpeg";
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": getApiKey(),
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-opus-4-20250514",
+      max_tokens: 2000,
+      system: "You are a health & safety inspector for a Mexican restaurant kitchen. You ALWAYS respond with valid JSON only — no preamble, no markdown, no explanation. Just raw JSON.",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: validMime, data: b64 } },
+          { type: "text", text: `Analyze this kitchen image from Casa Jaguar Mexican Food & Cafe, Glenorchy NZ.\n\nIdentify ALL visible cleaning tasks, hygiene issues, and maintenance needs you can see.\n\nRespond with ONLY this JSON structure (no other text):\n{\n  "areaDetected": "name of the kitchen area visible",\n  "overallRisk": "low|medium|high|critical",\n  "riskSummary": "one sentence describing the main hygiene concern",\n  "tasks": [\n    {\n      "name": "specific cleaning task name",\n      "area": "prep|grill|dishpit|walkin|storage|foh|bathrooms|patio|express",\n      "reason": "what you can see that requires this task",\n      "priority": "critical|high|medium|low",\n      "frequency": "Daily|Weekly|Monthly",\n      "timeEstimate": "X min",\n      "products": "specific cleaning products needed",\n      "sopContent": "1. Step one\\n2. Step two\\n3. Step three\\n4. Step four\\n5. Step five\\n⚠️ Safety tip here"\n    }\n  ]\n}` }
+        ]
+      }]
+    })
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  try {
+    return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim());
+  } catch(e) {
+    console.error("Vision parse error. Raw response:", text);
+    throw new Error("AI response was not valid JSON. Try again.");
+  }
 }
 
 function getStatus(task, logs) {
@@ -437,7 +464,7 @@ function AIScanView({ addTask }) {
       try {
         const r = await callClaudeVision(reader.result.split(",")[1], file.type || "image/jpeg");
         setResult(r);
-      } catch(e) { setErr("Could not analyze. Check API key has credits."); console.error(e); }
+      } catch(e) { setErr(`Analysis failed: ${e.message || "Check API key has credits and try again."}`); console.error(e); }
       setAnalyzing(false);
     };
     reader.readAsDataURL(file);
