@@ -37,34 +37,8 @@ const DEFAULT_TASKS = [
 
 function load(key, fb) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fb; } catch { return fb; } }
 function save(key, data) { try { localStorage.setItem(key, JSON.stringify(data)); } catch {} }
-function getApiKey() { return localStorage.getItem("cj_api_key") || ""; }
-
-async function callClaude(messages, system = "", maxTokens = 1200) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": getApiKey(),
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-      "Access-Control-Allow-Origin": "*"
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: maxTokens,
-      system,
-      messages
-    })
-  });
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    const msg = errData?.error?.message || `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-  const data = await res.json();
-  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
-  try { return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim()); } catch { return text; }
-}
+function getClaudeKey()  { return localStorage.getItem("cj_api_key")    || ""; }
+function getGeminiKey()  { return localStorage.getItem("cj_gemini_key") || ""; }
 
 function extractJSON(raw) {
   let s = raw.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
@@ -76,43 +50,79 @@ function extractJSON(raw) {
   return null;
 }
 
-async function callClaudeVision(b64, mime = "image/jpeg") {
-  const validMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mime) ? mime : "image/jpeg";
+async function callClaude(messages, system = "", maxTokens = 1200) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": getApiKey(),
+      "x-api-key": getClaudeKey(),
       "anthropic-version": "2023-06-01",
       "anthropic-dangerous-direct-browser-access": "true",
     },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2000,
-      system: "You are a health & safety inspector for a Mexican restaurant. Output ONLY raw JSON. No markdown, no explanation, no preamble. Start with { and end with }.",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: validMime, data: b64 } },
-            { type: "text", text: `Analyze this kitchen image from Casa Jaguar Mexican Food & Cafe, Glenorchy NZ. Identify all cleaning tasks and hygiene issues visible. Return ONLY this JSON (nothing else before or after):\n{"areaDetected":"area name","overallRisk":"low|medium|high|critical","riskSummary":"one sentence","tasks":[{"name":"task","area":"prep|grill|dishpit|walkin|storage|foh|bathrooms|patio|express","reason":"what you see","priority":"critical|high|medium|low","frequency":"Daily|Weekly|Monthly","timeEstimate":"X min","products":"products","sopContent":"1. Step\\n2. Step\\n3. Step\\n4. Step\\n5. Step\\n\u26a0\ufe0f Safety tip"}]}` }
-          ]
-        },
-        { role: "assistant", content: "{" }
-      ]
-    })
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, system, messages })
   });
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData?.error?.message || `HTTP ${res.status}`);
   }
   const data = await res.json();
-  const tail = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
-  const parsed = extractJSON("{" + tail);
-  if (parsed) return parsed;
-  console.error("Vision parse failed. Raw:", tail);
-  throw new Error("AI response was not valid JSON. Try again.");
+  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  const parsed = extractJSON(text);
+  return parsed !== null ? parsed : text;
 }
+
+async function callGeminiVision(b64, mime = "image/jpeg") {
+  const validMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mime) ? mime : "image/jpeg";
+  const prompt = `You are a health & safety inspector for Casa Jaguar Mexican Food & Cafe in Glenorchy, NZ.
+Analyze this kitchen image and identify ALL cleaning tasks, hygiene issues, and maintenance needs you can see.
+
+Respond ONLY with this exact JSON structure, no other text:
+{
+  "areaDetected": "name of the kitchen area",
+  "overallRisk": "low|medium|high|critical",
+  "riskSummary": "one sentence about main hygiene concern",
+  "tasks": [
+    {
+      "name": "specific cleaning task",
+      "area": "prep|grill|dishpit|walkin|storage|foh|bathrooms|patio|express",
+      "reason": "what you can visually see that requires this task",
+      "priority": "critical|high|medium|low",
+      "frequency": "Daily|Weekly|Monthly",
+      "timeEstimate": "X min",
+      "products": "cleaning products needed",
+      "sopContent": "1. Step one\n2. Step two\n3. Step three\n4. Step four\n5. Step five\n⚠️ Safety tip"
+    }
+  ]
+}`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${getGeminiKey()}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: validMime, data: b64 } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 2048 }
+      })
+    }
+  );
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData?.error?.message || `Gemini HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const parsed = extractJSON(text);
+  if (parsed) return parsed;
+  console.error("Gemini parse failed. Raw:", text);
+  throw new Error("Could not parse Gemini response. Try again.");
+}
+
 
 function getStatus(task, logs) {
   const now = Date.now(), tod = new Date().setHours(0,0,0,0), wk = now - 7*864e5, mo = now - 30*864e5;
@@ -135,30 +145,35 @@ function pColor(p) { return p==="critical"?B.red:p==="high"?B.orange:p==="medium
 
 // ── Setup Screen ──────────────────────────────────────────────
 function SetupScreen({ onSave }) {
-  const [key, setKey] = useState("");
-  const [testing, setTesting] = useState(false);
-  const [err, setErr] = useState("");
+  const [claudeKey, setClaudeKey] = useState("");
+  const [geminiKey, setGeminiKey] = useState("");
+  const [testing,   setTesting]   = useState(false);
+  const [err,       setErr]       = useState("");
+
+  const inp = (err) => ({width:"100%",background:"#252525",border:`1px solid ${err?B.red:"#3a3a3a"}`,borderRadius:10,padding:"12px 14px",color:B.cream,fontSize:13,outline:"none",fontFamily:"'Nunito',sans-serif",marginBottom:10});
 
   const testAndSave = async () => {
-    if (!key.trim().startsWith("sk-ant-")) { setErr("Key should start with sk-ant-"); return; }
+    if (!claudeKey.trim().startsWith("sk-ant-")) { setErr("Claude key should start with sk-ant-"); return; }
+    if (!geminiKey.trim()) { setErr("Please enter your Gemini API key"); return; }
     setTesting(true); setErr("");
     try {
-      localStorage.setItem("cj_api_key", key.trim());
-      const r = await callClaude([{ role:"user", content:'Reply with exactly: {"ok":true}' }], "Reply with valid JSON only.", 100);
-      if (r?.ok || r === '{"ok":true}' || JSON.stringify(r).includes("ok")) { onSave(); }
-      else { onSave(); } // if we got any response, key works
+      localStorage.setItem("cj_api_key",    claudeKey.trim());
+      localStorage.setItem("cj_gemini_key", geminiKey.trim());
+      // Test Claude
+      await callClaude([{ role:"user", content:"hi" }], "Say ok", 10);
+      onSave();
     } catch(e) {
       const msg = e.message || "";
       if (msg.includes("credit") || msg.includes("billing") || msg.includes("402")) {
-        setErr("No credits available. Add credits at console.anthropic.com/settings/billing");
+        setErr("No Claude credits. Add at console.anthropic.com/settings/billing");
       } else if (msg.includes("401") || msg.includes("auth")) {
-        setErr("Invalid API key. Please check and try again.");
-      } else if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
-        setErr("Network error. Please check your internet connection and try again.");
+        setErr("Invalid Claude API key.");
       } else {
-        setErr("Connection issue. Try again or check console.anthropic.com");
+        // Claude may fail but still save if Gemini key is provided
+        localStorage.setItem("cj_api_key",    claudeKey.trim());
+        localStorage.setItem("cj_gemini_key", geminiKey.trim());
+        onSave();
       }
-      localStorage.removeItem("cj_api_key");
     }
     setTesting(false);
   };
@@ -166,42 +181,37 @@ function SetupScreen({ onSave }) {
   return (
     <div style={{background:B.black,minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,fontFamily:"'Nunito',sans-serif"}}>
       <div style={{maxWidth:400,width:"100%"}}>
-        <div style={{textAlign:"center",marginBottom:32}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
           <div style={{fontSize:56,marginBottom:12}}>🐆</div>
           <div style={{fontWeight:900,fontSize:24,color:B.gold,letterSpacing:"0.05em"}}>CASA JAGUAR</div>
           <div style={{fontSize:11,color:B.muted,letterSpacing:"0.18em",marginTop:4}}>CLEAN & SOP AGENT</div>
         </div>
-        <div style={{background:B.card,borderRadius:16,padding:20,border:"1px solid #2a2a2a",marginBottom:16}}>
-          <div style={{fontWeight:800,fontSize:13,color:B.cream,marginBottom:6}}>Enter your Anthropic API Key</div>
-          <div style={{fontSize:11,color:B.muted,lineHeight:1.7,marginBottom:14}}>
-            Powers the AI scanning & SOP generation. Stored only on your device — never shared anywhere else.<br/><br/>
-            Get yours free at <span style={{color:B.teal}}>console.anthropic.com</span>
-          </div>
-          <input
-            type="password"
-            value={key}
-            onChange={e => setKey(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && testAndSave()}
-            placeholder="sk-ant-api03-..."
-            style={{width:"100%",background:"#252525",border:`1px solid ${err?B.red:"#3a3a3a"}`,borderRadius:10,padding:"12px 14px",color:B.cream,fontSize:13,outline:"none",fontFamily:"'Nunito',sans-serif",marginBottom:err?8:14}}
-          />
-          {err && <div style={{fontSize:11,color:B.red,marginBottom:12,lineHeight:1.5}}>⚠️ {err}</div>}
+
+        <div style={{background:B.card,borderRadius:16,padding:20,border:"1px solid #2a2a2a",marginBottom:12}}>
+          <div style={{fontWeight:800,fontSize:12,color:B.gold,marginBottom:4}}>🤖 Claude API Key</div>
+          <div style={{fontSize:10,color:B.muted,marginBottom:10}}>For AI Audit & SOP generation · <span style={{color:B.teal}}>console.anthropic.com</span></div>
+          <input type="password" value={claudeKey} onChange={e=>setClaudeKey(e.target.value)} placeholder="sk-ant-api03-..." style={inp(false)} />
+
+          <div style={{fontWeight:800,fontSize:12,color:"#4285F4",marginBottom:4,marginTop:6}}>🔍 Gemini API Key</div>
+          <div style={{fontSize:10,color:B.muted,marginBottom:10}}>For AI Kitchen Eye photo scan · <span style={{color:"#4285F4"}}>aistudio.google.com</span></div>
+          <input type="password" value={geminiKey} onChange={e=>setGeminiKey(e.target.value)} placeholder="AIza..." style={inp(false)} />
+
+          {err && <div style={{fontSize:11,color:B.red,marginBottom:10,lineHeight:1.5}}>⚠️ {err}</div>}
           <button
             onClick={testAndSave}
-            disabled={testing || !key.trim()}
-            style={{width:"100%",padding:"13px",borderRadius:12,border:"none",background:key.trim()?`linear-gradient(135deg,${B.gold},${B.orange})`:"#2a2a2a",color:key.trim()?B.black:B.muted,fontWeight:900,fontSize:14,cursor:key.trim()?"pointer":"default"}}
+            disabled={testing || !claudeKey.trim() || !geminiKey.trim()}
+            style={{width:"100%",padding:"13px",borderRadius:12,border:"none",background:(claudeKey.trim()&&geminiKey.trim())?`linear-gradient(135deg,${B.gold},${B.orange})`:"#2a2a2a",color:(claudeKey.trim()&&geminiKey.trim())?B.black:B.muted,fontWeight:900,fontSize:14,cursor:(claudeKey.trim()&&geminiKey.trim())?"pointer":"default",marginTop:4}}
           >
-            {testing ? "⏳ Testing connection..." : "CONNECT & START →"}
+            {testing ? "⏳ Connecting..." : "CONNECT & START →"}
           </button>
         </div>
+
         <div style={{background:`rgba(0,168,150,0.08)`,border:`1px solid ${B.teal}33`,borderRadius:12,padding:14}}>
-          <div style={{fontWeight:800,fontSize:11,color:B.teal,marginBottom:8}}>🔒 How to get your API key</div>
-          <div style={{fontSize:11,color:B.muted,lineHeight:1.9}}>
-            1. Go to <span style={{color:B.teal}}>console.anthropic.com</span><br/>
-            2. Sign up or log in<br/>
-            3. Click API Keys → Create Key<br/>
-            4. Copy and paste it above<br/>
-            5. New accounts get free credits to start
+          <div style={{fontWeight:800,fontSize:11,color:B.teal,marginBottom:8}}>🔑 How to get API keys</div>
+          <div style={{fontSize:11,color:B.muted,lineHeight:2}}>
+            <span style={{color:B.gold}}>Claude:</span> console.anthropic.com → API Keys<br/>
+            <span style={{color:"#4285F4"}}>Gemini:</span> aistudio.google.com → Get API Key<br/>
+            Both are free to start ✓
           </div>
         </div>
       </div>
@@ -289,7 +299,7 @@ function MainApp() {
           <button onClick={() => setManager(m=>!m)} style={{fontSize:10,fontWeight:800,padding:"5px 12px",borderRadius:20,border:`1.5px solid ${manager?B.gold:"#444"}`,background:manager?`rgba(247,160,25,0.12)`:"transparent",color:manager?B.gold:B.muted,cursor:"pointer"}}>
             {manager ? "⭐ MANAGER" : "STAFF VIEW"}
           </button>
-          <button onClick={() => { if(confirm("Remove API key and sign out?")) { localStorage.removeItem("cj_api_key"); window.location.reload(); }}} style={{background:"transparent",border:"none",color:"#444",cursor:"pointer",fontSize:20}}>⚙</button>
+          <button onClick={() => { if(confirm("Sign out and remove API keys?")) { localStorage.removeItem("cj_api_key"); localStorage.removeItem("cj_gemini_key"); window.location.reload(); }}} style={{background:"transparent",border:"none",color:"#444",cursor:"pointer",fontSize:20}}>⚙</button>
         </div>
       </div>
 
@@ -473,7 +483,7 @@ function AIScanView({ addTask }) {
     reader.onloadend = async () => {
       setImg(reader.result);
       try {
-        const r = await callClaudeVision(reader.result.split(",")[1], file.type || "image/jpeg");
+        const r = await callGeminiVision(reader.result.split(",")[1], file.type || "image/jpeg");
         setResult(r);
       } catch(e) { setErr(`Analysis failed: ${e.message || "Check API key has credits and try again."}`); console.error(e); }
       setAnalyzing(false);
@@ -722,7 +732,9 @@ function ManageView({ tasks, onAdd, onDelete, onBack }) {
 
 // ── Root ──────────────────────────────────────────────────────
 export default function App() {
-  const [hasKey, setHasKey] = useState(() => !!localStorage.getItem("cj_api_key"));
+  const [hasKey, setHasKey] = useState(() =>
+    !!localStorage.getItem("cj_api_key") && !!localStorage.getItem("cj_gemini_key")
+  );
   if (!hasKey) return <SetupScreen onSave={() => setHasKey(true)} />;
   return <MainApp />;
 }
