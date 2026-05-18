@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 
 const B = {
   gold:"#F7A019", orange:"#E85D1A", red:"#C0271A",
@@ -41,6 +41,7 @@ function getClaudeKey()  { return localStorage.getItem("cj_api_key")    || ""; }
 function getGeminiKey()  { return localStorage.getItem("cj_gemini_key") || ""; }
 
 function extractJSON(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null;
   let s = raw.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
   try { return JSON.parse(s); } catch {}
   const a = s.indexOf("{"), b = s.lastIndexOf("}");
@@ -50,12 +51,143 @@ function extractJSON(raw) {
   return null;
 }
 
+// ── Bulletproof helpers ───────────────────────────────────────
+const ACCEPTED_MIME    = ["image/jpeg","image/png","image/webp","image/gif"];
+const HEIC_PATTERN     = /heic|heif/i;
+const MAX_IMAGE_SIDE   = 1568;            // Gemini's recommended max edge
+const MAX_IMAGE_BYTES  = 4 * 1024 * 1024; // ~4MB hard cap on the compressed payload
+const REQUEST_TIMEOUT  = 60000;           // 60s per API call
+const VALID_AREAS      = AREAS.map(a => a.id);
+const VALID_PRIORITIES = ["critical","high","medium","low"];
+const VALID_GRADES     = ["A+","A","B","C","D","F"];
+const VALID_RISKS      = ["low","medium","high","critical"];
+
+function fetchWithTimeout(url, opts = {}, ms = REQUEST_TIMEOUT) {
+  const ctl = new AbortController();
+  const id  = setTimeout(() => ctl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(id));
+}
+
+function friendlyError(e, source = "AI") {
+  const m = (e?.message || String(e || "")).toLowerCase();
+  if (e?.name === "AbortError" || m.includes("aborted"))
+    return `Se acabó el tiempo de espera con ${source}. Revisa tu internet y reintenta.`;
+  if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network request"))
+    return `Sin conexión a internet. Conéctate y reintenta.`;
+  if (m.includes("credit") || m.includes("billing") || m.includes("quota") || m.includes("402") || m.includes("insufficient"))
+    return `Tu cuenta de ${source} no tiene créditos disponibles.`;
+  if (m.includes("401") || m.includes("403") || m.includes("api key") || m.includes("api_key") || m.includes("unauthorized") || m.includes("permission") || m.includes("forbidden"))
+    return `La API key de ${source} es inválida o no tiene permisos.`;
+  if (m.includes("429") || m.includes("rate") || m.includes("too many"))
+    return `Demasiadas peticiones a ${source}. Espera unos segundos y reintenta.`;
+  if (m.includes("payload") || m.includes("too large") || m.includes("413"))
+    return `La imagen es muy pesada. Toma otra foto o reduce su tamaño.`;
+  if (m.includes("safety") || m.includes("blocked") || m.includes("bloque"))
+    return `${source} bloqueó la imagen por filtros de seguridad. Intenta con otra foto.`;
+  if (m.includes("parse") || m.includes("json"))
+    return `${source} regresó una respuesta no válida. Reintenta.`;
+  if (m.includes("500") || m.includes("502") || m.includes("503") || m.includes("504") || m.includes("overloaded"))
+    return `${source} está temporalmente saturado. Espera unos segundos y reintenta.`;
+  return e?.message ? `Error de ${source}: ${e.message}` : `Error con ${source}. Reintenta.`;
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload  = () => resolve(img);
+    img.onerror = () => reject(new Error("No se pudo leer la imagen. ¿Formato soportado?"));
+    img.src = src;
+  });
+}
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload  = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(new Error("No se pudo leer el archivo."));
+    r.onabort = () => reject(new Error("Lectura del archivo cancelada."));
+    r.readAsDataURL(file);
+  });
+}
+
+async function compressImage(file) {
+  if (!file) throw new Error("No se seleccionó archivo.");
+  if (HEIC_PATTERN.test(file.type) || HEIC_PATTERN.test(file.name))
+    throw new Error("Tu foto es HEIC/HEIF (formato iPhone). Cambia el formato a JPG en Ajustes › Cámara › Formatos › Más compatible, o conviértela antes de subir.");
+  if (!file.type.startsWith("image/"))
+    throw new Error("El archivo seleccionado no es una imagen.");
+  if (file.size > 25 * 1024 * 1024)
+    throw new Error("La foto pesa más de 25MB. Usa una más ligera.");
+
+  const dataUrl = await readFileAsDataURL(file);
+  const img     = await loadImage(dataUrl);
+
+  let w = img.naturalWidth || img.width;
+  let h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error("La imagen no tiene dimensiones válidas.");
+
+  const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(w, h));
+  w = Math.max(1, Math.round(w * scale));
+  h = Math.max(1, Math.round(h * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Tu navegador no soporta canvas.");
+  ctx.drawImage(img, 0, 0, w, h);
+
+  let quality = 0.85;
+  let blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", quality));
+  while (blob && blob.size > MAX_IMAGE_BYTES && quality > 0.4) {
+    quality -= 0.15;
+    blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", quality));
+  }
+  if (!blob) throw new Error("No se pudo comprimir la imagen.");
+
+  const out = await readFileAsDataURL(blob);
+  const base64 = out.split(",")[1] || "";
+  if (!base64) throw new Error("No se pudo convertir la imagen a base64.");
+
+  return { base64, mime: "image/jpeg", previewUrl: out, bytes: blob.size };
+}
+
+function normalizeScannedTask(t, fallbackArea = "prep") {
+  if (!t || typeof t !== "object") return null;
+  const name = typeof t.name === "string" ? t.name.trim() : "";
+  if (!name) return null;
+  return {
+    name:         name.slice(0, 200),
+    area:         VALID_AREAS.includes(t.area)        ? t.area      : fallbackArea,
+    frequency:    FREQUENCIES.includes(t.frequency)   ? t.frequency : "Daily",
+    priority:     VALID_PRIORITIES.includes(t.priority) ? t.priority : "medium",
+    timeEstimate: typeof t.timeEstimate === "string" && t.timeEstimate ? t.timeEstimate.slice(0, 40) : "10 min",
+    products:     typeof t.products    === "string" ? t.products.slice(0, 300) : "",
+    sopContent:   typeof t.sopContent  === "string" ? t.sopContent.slice(0, 2000) : "",
+    reason:       typeof t.reason      === "string" ? t.reason.slice(0, 300) : ""
+  };
+}
+
+function validateScanResult(r) {
+  if (!r || typeof r !== "object") throw new Error("La IA devolvió una respuesta vacía.");
+  const rawTasks = Array.isArray(r.tasks) ? r.tasks : [];
+  const tasks    = rawTasks.map(t => normalizeScannedTask(t)).filter(Boolean);
+  if (tasks.length === 0) throw new Error("La IA no detectó tareas en esta foto. Intenta más cerca, mejor iluminación o desde otro ángulo.");
+  return {
+    areaDetected: typeof r.areaDetected === "string" && r.areaDetected ? r.areaDetected.slice(0, 80) : "Área detectada",
+    overallRisk:  VALID_RISKS.includes(r.overallRisk) ? r.overallRisk : "medium",
+    riskSummary:  typeof r.riskSummary === "string" && r.riskSummary ? r.riskSummary.slice(0, 400) : "Revisión general de higiene.",
+    tasks
+  };
+}
+
 async function callClaude(messages, system = "", maxTokens = 1200) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const key = getClaudeKey();
+  if (!key) throw new Error("Falta la API key de Claude.");
+  const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": getClaudeKey(),
+      "x-api-key": key,
       "anthropic-version": "2023-06-01",
       "anthropic-dangerous-direct-browser-access": "true",
     },
@@ -65,14 +197,19 @@ async function callClaude(messages, system = "", maxTokens = 1200) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData?.error?.message || `HTTP ${res.status}`);
   }
-  const data = await res.json();
+  const data = await res.json().catch(() => null);
+  if (!data) throw new Error("Claude devolvió una respuesta no parseable.");
   const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  if (!text) throw new Error("Claude devolvió contenido vacío.");
   const parsed = extractJSON(text);
   return parsed !== null ? parsed : text;
 }
 
 async function callGeminiVision(b64, mime = "image/jpeg") {
-  const validMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mime) ? mime : "image/jpeg";
+  const key = getGeminiKey();
+  if (!key) throw new Error("Falta la API key de Gemini.");
+  if (!b64)  throw new Error("Imagen vacía.");
+  const validMime = ACCEPTED_MIME.includes(mime) ? mime : "image/jpeg";
   const prompt = `You are a health & safety inspector for Casa Jaguar Mexican Food & Cafe in Glenorchy, NZ.
 Analyze this kitchen image and identify ALL cleaning tasks, hygiene issues, and maintenance needs you can see.
 
@@ -93,10 +230,11 @@ Respond ONLY with this exact JSON structure, no other text:
       "sopContent": "1. Step one\n2. Step two\n3. Step three\n4. Step four\n5. Step five\n⚠️ Safety tip"
     }
   ]
-}`;
+}
+Every task MUST use one of the exact area codes listed above. If you cannot see at least one task, still return the JSON with an empty tasks array.`;
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${getGeminiKey()}`,
+  const res = await fetchWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -107,7 +245,11 @@ Respond ONLY with this exact JSON structure, no other text:
             { text: prompt }
           ]
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 2048 }
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 2048,
+          responseMimeType: "application/json"
+        }
       })
     }
   );
@@ -115,12 +257,26 @@ Respond ONLY with this exact JSON structure, no other text:
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData?.error?.message || `Gemini HTTP ${res.status}`);
   }
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const data = await res.json().catch(() => null);
+  if (!data) throw new Error("Gemini devolvió una respuesta no parseable.");
+
+  const block = data.promptFeedback?.blockReason;
+  if (block) throw new Error(`Gemini bloqueó la imagen (${block}). Intenta con otra foto.`);
+
+  const candidate = data.candidates?.[0];
+  if (!candidate) throw new Error("Gemini no devolvió resultados. Reintenta.");
+  if (candidate.finishReason && !["STOP","MAX_TOKENS"].includes(candidate.finishReason)) {
+    throw new Error(`Gemini detuvo el análisis (${candidate.finishReason}). Intenta otra foto.`);
+  }
+  const text = candidate.content?.parts?.map(p => p.text).filter(Boolean).join("") || "";
+  if (!text) throw new Error("Gemini devolvió contenido vacío. Reintenta.");
+
   const parsed = extractJSON(text);
-  if (parsed) return parsed;
-  console.error("Gemini parse failed. Raw:", text);
-  throw new Error("Could not parse Gemini response. Try again.");
+  if (!parsed) {
+    console.error("Gemini parse failed. Raw:", text);
+    throw new Error("La respuesta de Gemini no es JSON válido. Reintenta.");
+  }
+  return validateScanResult(parsed);
 }
 
 
@@ -153,25 +309,27 @@ function SetupScreen({ onSave }) {
   const inp = (err) => ({width:"100%",background:"#252525",border:`1px solid ${err?B.red:"#3a3a3a"}`,borderRadius:10,padding:"12px 14px",color:B.cream,fontSize:13,outline:"none",fontFamily:"'Nunito',sans-serif",marginBottom:10});
 
   const testAndSave = async () => {
-    if (!claudeKey.trim().startsWith("sk-ant-")) { setErr("Claude key should start with sk-ant-"); return; }
-    if (!geminiKey.trim()) { setErr("Please enter your Gemini API key"); return; }
+    const ck = claudeKey.trim(), gk = geminiKey.trim();
+    if (!ck.startsWith("sk-ant-")) { setErr("La key de Claude debe empezar con sk-ant-"); return; }
+    if (!gk)                         { setErr("Ingresa tu API key de Gemini");           return; }
+    if (!gk.startsWith("AIza"))      { setErr("La key de Gemini suele empezar con AIza"); return; }
     setTesting(true); setErr("");
+    localStorage.setItem("cj_api_key",    ck);
+    localStorage.setItem("cj_gemini_key", gk);
     try {
-      localStorage.setItem("cj_api_key",    claudeKey.trim());
-      localStorage.setItem("cj_gemini_key", geminiKey.trim());
-      // Test Claude
       await callClaude([{ role:"user", content:"hi" }], "Say ok", 10);
       onSave();
     } catch(e) {
-      const msg = e.message || "";
-      if (msg.includes("credit") || msg.includes("billing") || msg.includes("402")) {
-        setErr("No Claude credits. Add at console.anthropic.com/settings/billing");
-      } else if (msg.includes("401") || msg.includes("auth")) {
-        setErr("Invalid Claude API key.");
+      const msg = (e.message || "").toLowerCase();
+      const isCreditOrAuth = msg.includes("credit") || msg.includes("billing") || msg.includes("402")
+                           || msg.includes("401") || msg.includes("auth") || msg.includes("api key");
+      if (isCreditOrAuth) {
+        // Borra credenciales malas para que el usuario las corrija
+        localStorage.removeItem("cj_api_key");
+        setErr(friendlyError(e, "Claude") + " Corrige y reintenta.");
       } else {
-        // Claude may fail but still save if Gemini key is provided
-        localStorage.setItem("cj_api_key",    claudeKey.trim());
-        localStorage.setItem("cj_gemini_key", geminiKey.trim());
+        // Errores transitorios (red, timeout, 5xx) — guardamos y dejamos pasar
+        console.warn("Claude test no concluyente:", e);
         onSave();
       }
     }
@@ -243,7 +401,11 @@ function MainApp() {
     setSelTask(null);
   };
 
-  const addTask    = t  => setTasks(p => [...p, { ...t, id:`task_${Date.now()}` }]);
+  const addTask = (t) => {
+    const safe = normalizeScannedTask(t);
+    if (!safe) return;
+    setTasks(p => [...p, { ...safe, id:`task_${Date.now()}_${Math.random().toString(36).slice(2,6)}` }]);
+  };
   const deleteTask = id => { setTasks(p => p.filter(t => t.id !== id)); setSelTask(null); };
 
   const runAudit = async () => {
@@ -259,8 +421,25 @@ function MainApp() {
         [{ role:"user", content:`Casa Jaguar kitchen compliance. Completed: ${tl.length}/${daily.length} daily. Missing: ${missing.join(",")||"None"}. Top staff: ${top?`${top[0]} (${top[1]})`:"None yet"}. Return ONLY JSON: {"score":number,"grade":"A+|A|B|C|D|F","summary":"2 sentences","shoutout":"praise","recommendation":"1 tip","criticalMissing":"missing task or All done!"}` }],
         "You are a health inspector. JSON only."
       );
-      setAudit(r);
-    } catch(e) { console.error(e); }
+      if (!r || typeof r !== "object") throw new Error("Respuesta no estructurada.");
+      setAudit({
+        score:           typeof r.score === "number" ? r.score : 0,
+        grade:           VALID_GRADES.includes(r.grade) ? r.grade : "—",
+        summary:         typeof r.summary === "string" ? r.summary : "",
+        shoutout:        typeof r.shoutout === "string" ? r.shoutout : "",
+        recommendation:  typeof r.recommendation === "string" ? r.recommendation : "",
+        criticalMissing: typeof r.criticalMissing === "string" ? r.criticalMissing : "",
+        error: false
+      });
+    } catch(e) {
+      console.error(e);
+      setAudit({
+        score: 0, grade: "—",
+        summary: friendlyError(e, "Claude"),
+        shoutout: "", recommendation: "", criticalMissing: "",
+        error: true
+      });
+    }
     setAuditing(false);
   };
 
@@ -318,7 +497,7 @@ function MainApp() {
                     <div style={{fontSize:10,color:B.muted,letterSpacing:"0.1em",marginBottom:3}}>TODAY'S COMPLIANCE</div>
                     <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                       <div style={{fontSize:40,fontWeight:900,color:pct>=80?B.teal:pct>=60?B.gold:B.red,lineHeight:1}}>{pct}%</div>
-                      {audit && <div style={{fontSize:20,fontWeight:900,color:B.gold}}>{audit.grade}</div>}
+                      {audit && <div style={{fontSize:20,fontWeight:900,color:audit.error?B.red:B.gold}}>{audit.grade}</div>}
                     </div>
                     <div style={{fontSize:10,color:B.muted,marginTop:3}}>{doneToday}/{daily.length} daily tasks</div>
                   </div>
@@ -335,12 +514,18 @@ function MainApp() {
                   ))}
                 </div>
                 {audit && (
-                  <div style={{background:"rgba(0,0,0,0.3)",borderRadius:10,padding:10,fontSize:11,lineHeight:1.7}}>
-                    <div style={{color:B.cream,marginBottom:4}}>⚡ {audit.summary}</div>
-                    <div style={{color:B.gold,marginBottom:4}}>⭐ {audit.shoutout}</div>
-                    <div style={{color:B.teal}}>💡 {audit.recommendation}</div>
-                    {audit.criticalMissing && audit.criticalMissing !== "All done!" && (
-                      <div style={{color:B.red,marginTop:5,fontWeight:700}}>⚠️ {audit.criticalMissing}</div>
+                  <div style={{background:"rgba(0,0,0,0.3)",borderRadius:10,padding:10,fontSize:11,lineHeight:1.7,border:audit.error?`1px solid ${B.red}55`:"none"}}>
+                    {audit.error ? (
+                      <div style={{color:B.red}}>⚠️ {audit.summary}</div>
+                    ) : (
+                      <>
+                        {audit.summary        && <div style={{color:B.cream,marginBottom:4}}>⚡ {audit.summary}</div>}
+                        {audit.shoutout       && <div style={{color:B.gold,marginBottom:4}}>⭐ {audit.shoutout}</div>}
+                        {audit.recommendation && <div style={{color:B.teal}}>💡 {audit.recommendation}</div>}
+                        {audit.criticalMissing && audit.criticalMissing !== "All done!" && (
+                          <div style={{color:B.red,marginTop:5,fontWeight:700}}>⚠️ {audit.criticalMissing}</div>
+                        )}
+                      </>
                     )}
                   </div>
                 )}
@@ -470,25 +655,62 @@ function MainApp() {
 
 // ── AI Scan ───────────────────────────────────────────────────
 function AIScanView({ addTask }) {
-  const [img,       setImg]       = useState(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [result,    setResult]    = useState(null);
-  const [added,     setAdded]     = useState(new Set());
-  const [err,       setErr]       = useState(null);
+  const [img,         setImg]         = useState(null);
+  const [analyzing,   setAnalyzing]   = useState(false);
+  const [result,      setResult]      = useState(null);
+  const [added,       setAdded]       = useState(new Set());
+  const [err,         setErr]         = useState(null);
+  const [phase,       setPhase]       = useState("");        // "compressing" | "analyzing"
+  const [lastPayload, setLastPayload] = useState(null);      // { base64, mime } para reintentar
+  const uploadIdRef = useRef(0);
 
-  const handleImg = async e => {
-    const file = e.target.files[0]; if (!file) return;
-    setAnalyzing(true); setResult(null); setErr(null); setAdded(new Set());
-    const reader = new FileReader();
-    reader.onloadend = async () => {
-      setImg(reader.result);
-      try {
-        const r = await callGeminiVision(reader.result.split(",")[1], file.type || "image/jpeg");
-        setResult(r);
-      } catch(e) { setErr(`Analysis failed: ${e.message || "Check API key has credits and try again."}`); console.error(e); }
-      setAnalyzing(false);
-    };
-    reader.readAsDataURL(file);
+  const runAnalysis = async (base64, mime, uploadId) => {
+    setPhase("analyzing");
+    try {
+      const r = await callGeminiVision(base64, mime);
+      if (uploadIdRef.current !== uploadId) return;
+      setResult(r);
+      setErr(null);
+    } catch(e) {
+      if (uploadIdRef.current !== uploadId) return;
+      console.error(e);
+      setErr(friendlyError(e, "Gemini"));
+    } finally {
+      if (uploadIdRef.current === uploadId) { setAnalyzing(false); setPhase(""); }
+    }
+  };
+
+  const handleImg = async (e) => {
+    const file = e.target.files?.[0];
+    if (e.target) e.target.value = "";    // permite re-seleccionar la misma foto
+    if (!file) return;
+    const uploadId = ++uploadIdRef.current;
+    setAnalyzing(true); setResult(null); setErr(null); setAdded(new Set()); setImg(null); setLastPayload(null);
+    setPhase("compressing");
+    try {
+      const { base64, mime, previewUrl } = await compressImage(file);
+      if (uploadIdRef.current !== uploadId) return;
+      setImg(previewUrl);
+      setLastPayload({ base64, mime });
+      await runAnalysis(base64, mime, uploadId);
+    } catch(ex) {
+      if (uploadIdRef.current !== uploadId) return;
+      console.error(ex);
+      setErr(ex.message || "Error procesando la imagen.");
+      setAnalyzing(false); setPhase("");
+    }
+  };
+
+  const retry = async () => {
+    if (!lastPayload || analyzing) return;
+    const uploadId = ++uploadIdRef.current;
+    setAnalyzing(true); setErr(null); setResult(null); setAdded(new Set());
+    await runAnalysis(lastPayload.base64, lastPayload.mime, uploadId);
+  };
+
+  const reset = () => {
+    uploadIdRef.current++;                // invalida cualquier análisis en vuelo
+    setImg(null); setResult(null); setErr(null); setAdded(new Set()); setAnalyzing(false); setPhase(""); setLastPayload(null);
   };
 
   const riskC = r => r==="critical"?B.red:r==="high"?B.orange:r==="medium"?B.gold:B.teal;
@@ -500,29 +722,47 @@ function AIScanView({ addTask }) {
         <div style={{fontSize:11,color:B.muted,marginTop:4}}>Snap any station — get instant analysis & SOP</div>
       </div>
 
-      {!img ? (
+      {(!img && !analyzing) ? (
         <label style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",width:"100%",height:220,border:`2px dashed ${B.gold}`,borderRadius:18,background:"rgba(247,160,25,0.04)",cursor:"pointer"}}>
           <span style={{fontSize:44}}>📷</span>
           <div style={{fontWeight:900,fontSize:15,color:B.gold,marginTop:10}}>SNAP OR UPLOAD PHOTO</div>
           <div style={{fontSize:11,color:B.muted,marginTop:5}}>Prep, grill, fridge, FOH, bathrooms...</div>
-          <input type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={handleImg} />
+          <div style={{fontSize:10,color:B.muted,marginTop:3}}>JPG, PNG o WebP · max 25MB</div>
+          <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" capture="environment" style={{display:"none"}} onChange={handleImg} />
         </label>
       ) : (
-        <div style={{position:"relative",borderRadius:14,overflow:"hidden",marginBottom:14}}>
-          <img src={img} alt="scan" style={{width:"100%",height:220,objectFit:"cover",display:"block"}} />
+        <div style={{position:"relative",borderRadius:14,overflow:"hidden",marginBottom:14,background:"#000",minHeight:220}}>
+          {img && <img src={img} alt="scan" style={{width:"100%",height:220,objectFit:"cover",display:"block"}} />}
           {analyzing && (
             <div style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.82)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10}}>
               <span style={{fontSize:36,display:"inline-block",animation:"spin 2s linear infinite"}}>🐆</span>
-              <div style={{fontWeight:900,fontSize:13,color:B.gold}}>ANALYZING KITCHEN...</div>
+              <div style={{fontWeight:900,fontSize:13,color:B.gold}}>
+                {phase === "compressing" ? "PREPARANDO IMAGEN..." : "ANALIZANDO COCINA..."}
+              </div>
+              <div style={{fontSize:10,color:B.muted}}>Puede tardar hasta 60s</div>
             </div>
           )}
           {!analyzing && (
-            <button onClick={() => { setImg(null); setResult(null); setErr(null); }} style={{position:"absolute",top:10,right:10,background:"rgba(0,0,0,0.7)",border:"none",borderRadius:"50%",width:28,height:28,cursor:"pointer",color:B.cream,fontSize:16}}>×</button>
+            <button onClick={reset} style={{position:"absolute",top:10,right:10,background:"rgba(0,0,0,0.7)",border:"none",borderRadius:"50%",width:28,height:28,cursor:"pointer",color:B.cream,fontSize:16}}>×</button>
           )}
         </div>
       )}
 
-      {err && <div style={{background:`rgba(192,39,26,0.12)`,border:`1px solid ${B.red}`,borderRadius:10,padding:12,color:B.red,fontSize:12,textAlign:"center",marginBottom:12}}>⚠️ {err}</div>}
+      {err && (
+        <div style={{background:`rgba(192,39,26,0.12)`,border:`1px solid ${B.red}`,borderRadius:10,padding:12,marginBottom:12}}>
+          <div style={{color:B.red,fontSize:12,textAlign:"center",marginBottom:lastPayload?10:0,lineHeight:1.5}}>⚠️ {err}</div>
+          {lastPayload && (
+            <div style={{display:"flex",gap:8,justifyContent:"center"}}>
+              <button onClick={retry} disabled={analyzing} style={{background:B.gold,color:B.black,border:"none",borderRadius:8,padding:"7px 14px",fontSize:11,fontWeight:900,cursor:analyzing?"default":"pointer"}}>
+                🔄 REINTENTAR
+              </button>
+              <button onClick={reset} style={{background:"transparent",color:B.muted,border:`1px solid ${B.muted}55`,borderRadius:8,padding:"7px 14px",fontSize:11,fontWeight:800,cursor:"pointer"}}>
+                ✕ CANCELAR
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {result && !analyzing && (
         <div>
@@ -656,18 +896,24 @@ function TaskModal({ task, logs, onClose, onComplete, onDelete }) {
 function ManageView({ tasks, onAdd, onDelete, onBack }) {
   const [adding,  setAdding]  = useState(false);
   const [genSOP,  setGenSOP]  = useState(false);
+  const [sopErr,  setSopErr]  = useState("");
   const [nt, setNT] = useState({name:"",area:"prep",frequency:"Daily",priority:"high",timeEstimate:"",products:"",sopContent:""});
 
   const generateSOP = async () => {
-    if (!nt.name) return; setGenSOP(true);
+    if (!nt.name.trim()) return;
+    setGenSOP(true); setSopErr("");
     const ar = AREAS.find(a => a.id === nt.area);
     try {
       const r = await callClaude(
         [{ role:"user", content:`Write a 5-step cleaning SOP for Casa Jaguar Mexican Restaurant for: "${nt.name}" in the ${ar?.label} area. Include a safety tip at the end. Plain numbered text only.` }],
         "You are an executive chef writing kitchen SOPs. Be specific and safety-conscious."
       );
-      setNT(p => ({...p, sopContent: typeof r==="string" ? r : JSON.stringify(r)}));
-    } catch(e) { console.error(e); }
+      const text = typeof r === "string" ? r : (r?.sopContent || r?.text || JSON.stringify(r));
+      setNT(p => ({...p, sopContent: text}));
+    } catch(e) {
+      console.error(e);
+      setSopErr(friendlyError(e, "Claude"));
+    }
     setGenSOP(false);
   };
 
@@ -692,10 +938,11 @@ function ManageView({ tasks, onAdd, onDelete, onBack }) {
         <input value={nt.products} onChange={e=>setNT({...nt,products:e.target.value})} placeholder="Cleaning products needed" style={inp} />
         <div style={{position:"relative"}}>
           <textarea value={nt.sopContent} onChange={e=>setNT({...nt,sopContent:e.target.value})} placeholder="SOP steps... or hit AI SOP to generate" rows={5} style={{...inp,resize:"none",paddingBottom:42,display:"block"}} />
-          <button onClick={generateSOP} disabled={genSOP||!nt.name} style={{position:"absolute",bottom:8,right:8,background:genSOP||!nt.name?"#333":B.gold,color:genSOP||!nt.name?B.muted:B.black,border:"none",borderRadius:9,padding:"6px 12px",fontSize:10,fontWeight:900,cursor:nt.name&&!genSOP?"pointer":"default"}}>
+          <button onClick={generateSOP} disabled={genSOP||!nt.name.trim()} style={{position:"absolute",bottom:8,right:8,background:genSOP||!nt.name.trim()?"#333":B.gold,color:genSOP||!nt.name.trim()?B.muted:B.black,border:"none",borderRadius:9,padding:"6px 12px",fontSize:10,fontWeight:900,cursor:nt.name.trim()&&!genSOP?"pointer":"default"}}>
             {genSOP?"⏳":"✨"} AI SOP
           </button>
         </div>
+        {sopErr && <div style={{background:`rgba(192,39,26,0.12)`,border:`1px solid ${B.red}55`,borderRadius:9,padding:"8px 10px",color:B.red,fontSize:11,lineHeight:1.4}}>⚠️ {sopErr}</div>}
         <button onClick={()=>{onAdd({...nt,createdAt:Date.now()});setAdding(false);setNT({name:"",area:"prep",frequency:"Daily",priority:"high",timeEstimate:"",products:"",sopContent:""});}} disabled={!nt.name.trim()} style={{padding:"13px",borderRadius:12,border:"none",background:nt.name.trim()?`linear-gradient(135deg,${B.gold},${B.orange})`:"#2a2a2a",color:nt.name.trim()?B.black:B.muted,fontWeight:900,fontSize:13,cursor:nt.name.trim()?"pointer":"default"}}>
           SAVE TASK
         </button>
